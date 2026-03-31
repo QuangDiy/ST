@@ -335,18 +335,26 @@ def build_static_bm25_dataset(
     for idx in range(args.num_hard_negatives):
         dataset_dict[f"negative_{idx + 1}"] = []
 
-    for row in train_dataset:
+    print(
+        f"[info] BM25 retrieval complete. Building static training dataset for {len(train_dataset)} rows..."
+    )
+    for row_index, row in enumerate(train_dataset, start=1):
         dataset_dict["query"].append(row["query"])
         dataset_dict["positive"].append(row["positive"])
         negatives = negative_lookup[row["query"]]
         for idx, negative in enumerate(negatives, start=1):
             dataset_dict[f"negative_{idx}"].append(negative)
+        if row_index % 10000 == 0 or row_index == len(train_dataset):
+            print(f"[info] Materialized {row_index}/{len(train_dataset)} training rows")
 
+    print("[info] Converting mined examples to Hugging Face Dataset...")
     static_dataset = Dataset.from_dict(dataset_dict)
     cache_dir.parent.mkdir(parents=True, exist_ok=True)
     if cache_dir.exists():
         shutil.rmtree(cache_dir)
+    print(f"[info] Saving static BM25 cache to {cache_dir}...")
     static_dataset.save_to_disk(str(cache_dir))
+    print("[info] Static BM25 cache saved.")
 
     stats = {
         "bm25_candidate_pool": candidate_pool,

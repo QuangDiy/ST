@@ -36,6 +36,7 @@ python train_vn_retrieval_bm25.py \
   --epochs 3 \
   --num_hard_negatives 5 \
   --bm25_candidate_pool 64 \
+  --bm25-
   --per_device_train_batch_size 64 \
   --loss_mini_batch_size 16
 ```
