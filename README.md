@@ -36,9 +36,11 @@ python train_vn_retrieval_bm25.py \
   --epochs 3 \
   --num_hard_negatives 5 \
   --bm25_candidate_pool 64 \
-  --bm25-
+  --bm25_query_batch_size 1024 \
+  --greennode_eval_queries 2048 \
   --per_device_train_batch_size 64 \
-  --loss_mini_batch_size 16
+  --loss_mini_batch_size 16 \
+  --fp16
 ```
 
 Useful flags:
@@ -47,6 +49,7 @@ Useful flags:
 - `--max_train_pairs N` is handy for smoke tests
 - `--overwrite_bm25_cache` rebuilds the static BM25 negatives
 - `--bm25_query_batch_size` controls how many queries are mined per BM25 batch to avoid long silent runs
+- `--greennode_eval_queries` controls how many GreenNode train qrels queries are held out for in-training retrieval eval
 - `--fp16` or `--bf16` depends on your GPU
 
 The script uses:
@@ -54,7 +57,7 @@ The script uses:
 - `GreenNode` qrels train split for supervised retrieval pairs
 - `UIT-ViQuAD2.0` train split with `question -> context` positives
 - BM25 negatives from the merged retrieval corpus
-- `UIT-ViQuAD2.0` validation split for quick dev retrieval evaluation
+- in-training retrieval evaluation on both `UIT-ViQuAD2.0` validation and a held-out subset of `GreenNode` train queries
 
 ## Evaluate
 
@@ -74,3 +77,4 @@ The evaluation script runs MTEB on:
 - `GreenNode` has a slightly awkward Hub layout, so the training script reads the raw `corpus.jsonl`, `queries.jsonl`, and `qrels/train.jsonl` files directly.
 - The model is wrapped as `Transformer + mean pooling + Normalize`, so it becomes a proper single-vector sentence-transformer model.
 - BM25 negatives are mined once and cached to disk in `output/.../bm25_static_cache` by default, which keeps repeated experiments much faster.
+- Training now runs retrieval evaluation at the start, after each epoch, and at the end using both ViQuAD and a held-out GreenNode subset.

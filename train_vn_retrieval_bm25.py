@@ -17,10 +17,14 @@ from sentence_transformers import (
     SentenceTransformerTrainer,
     SentenceTransformerTrainingArguments,
 )
-from sentence_transformers.evaluation import InformationRetrievalEvaluator
+from sentence_transformers.evaluation import (
+    InformationRetrievalEvaluator,
+    SequentialEvaluator,
+)
 from sentence_transformers.losses import CachedMultipleNegativesRankingLoss
 from sentence_transformers.models import Normalize, Pooling, Transformer
 from sentence_transformers.training_args import BatchSamplers
+from tqdm.auto import tqdm
 
 
 logging.getLogger("bm25s").setLevel(logging.WARNING)
@@ -55,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bm25_query_batch_size", type=int, default=2048)
     parser.add_argument("--max_train_pairs", type=int, default=None)
     parser.add_argument("--max_eval_queries", type=int, default=2048)
+    parser.add_argument("--greennode_eval_queries", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bm25_cache_dir", type=str, default=None)
     parser.add_argument("--overwrite_bm25_cache", action="store_true")
@@ -105,7 +110,9 @@ def deduplicate_pairs(
     return dedup_queries, dedup_positives
 
 
-def load_greennode_training_data() -> tuple[list[str], list[str], list[str]]:
+def load_greennode_resources() -> tuple[
+    dict[str, str], dict[str, str], dict[str, dict[str, int]]
+]:
     corpus_ds = load_json_dataset(f"{GREENNODE_BASE_URL}/corpus.jsonl")
     queries_ds = load_json_dataset(f"{GREENNODE_BASE_URL}/queries.jsonl")
     qrels_ds = load_json_dataset(f"{GREENNODE_BASE_URL}/qrels/train.jsonl")
@@ -115,20 +122,62 @@ def load_greennode_training_data() -> tuple[list[str], list[str], list[str]]:
         for row in corpus_ds
     }
     query_by_id = {row["_id"]: clean_text(row["text"]) for row in queries_ds}
+    qrels_by_query: dict[str, dict[str, int]] = defaultdict(dict)
 
-    queries = []
-    positives = []
     for row in qrels_ds:
         if row.get("score", 0) <= 0:
             continue
-        query_text = query_by_id.get(row["query-id"])
-        positive_text = corpus_by_id.get(row["corpus-id"])
-        if not query_text or not positive_text:
+        query_id = row["query-id"]
+        corpus_id = row["corpus-id"]
+        if query_id not in query_by_id or corpus_id not in corpus_by_id:
             continue
-        queries.append(query_text)
-        positives.append(positive_text)
+        qrels_by_query[query_id][corpus_id] = int(row.get("score", 1))
 
-    return queries, positives, list(corpus_by_id.values())
+    return corpus_by_id, query_by_id, qrels_by_query
+
+
+def build_greennode_train_and_evaluator(
+    eval_query_count: int,
+    seed: int,
+) -> tuple[
+    list[str], list[str], list[str], InformationRetrievalEvaluator, dict[str, int]
+]:
+    corpus_by_id, query_by_id, qrels_by_query = load_greennode_resources()
+    all_query_ids = list(qrels_by_query)
+    rng = random.Random(seed)
+    eval_query_count = min(eval_query_count, len(all_query_ids))
+    eval_query_ids = set(rng.sample(all_query_ids, eval_query_count))
+
+    train_queries = []
+    train_positives = []
+    relevant_docs = {}
+    eval_queries = {}
+
+    for query_id, doc_scores in qrels_by_query.items():
+        query_text = query_by_id[query_id]
+        if query_id in eval_query_ids:
+            eval_queries[query_id] = query_text
+            relevant_docs[query_id] = {corpus_id: 1 for corpus_id in doc_scores}
+            continue
+
+        for corpus_id in doc_scores:
+            train_queries.append(query_text)
+            train_positives.append(corpus_by_id[corpus_id])
+
+    evaluator = InformationRetrievalEvaluator(
+        queries=eval_queries,
+        corpus=corpus_by_id,
+        relevant_docs=relevant_docs,
+        name="greennode-train-dev",
+        show_progress_bar=False,
+    )
+    stats = {
+        "greennode_train_pairs": len(train_queries),
+        "greennode_eval_queries": len(eval_queries),
+        "greennode_corpus_docs": len(corpus_by_id),
+    }
+
+    return train_queries, train_positives, list(corpus_by_id.values()), evaluator, stats
 
 
 def load_viquad_training_data() -> tuple[list[str], list[str], list[str]]:
@@ -154,10 +203,18 @@ def load_viquad_training_data() -> tuple[list[str], list[str], list[str]]:
     return queries, positives, list(corpus)
 
 
-def build_train_pairs(
-    max_train_pairs: int | None = None,
-) -> tuple[Dataset, list[str], dict[str, int]]:
-    gn_queries, gn_positives, gn_corpus = load_greennode_training_data()
+def build_train_data_and_evaluator(
+    max_train_pairs: int | None,
+    viquad_eval_queries: int,
+    greennode_eval_queries: int,
+    seed: int,
+) -> tuple[Dataset, list[str], dict[str, int], SequentialEvaluator]:
+    gn_queries, gn_positives, gn_corpus, gn_evaluator, gn_stats = (
+        build_greennode_train_and_evaluator(
+            eval_query_count=greennode_eval_queries,
+            seed=seed,
+        )
+    )
     vq_queries, vq_positives, vq_corpus = load_viquad_training_data()
 
     queries = gn_queries + vq_queries
@@ -170,13 +227,21 @@ def build_train_pairs(
 
     corpus = list(dict.fromkeys(gn_corpus + vq_corpus + positives))
     train_dataset = Dataset.from_dict({"query": queries, "positive": positives})
+    viquad_evaluator = build_viquad_dev_evaluator(
+        max_eval_queries=viquad_eval_queries,
+        seed=seed,
+    )
+    combined_evaluator = SequentialEvaluator(
+        [viquad_evaluator, gn_evaluator],
+        main_score_function=lambda scores: sum(scores) / len(scores),
+    )
     stats = {
-        "greennode_pairs": len(gn_queries),
+        **gn_stats,
         "viquad_pairs": len(vq_queries),
         "train_pairs": len(train_dataset),
         "corpus_size": len(corpus),
     }
-    return train_dataset, corpus, stats
+    return train_dataset, corpus, stats, combined_evaluator
 
 
 def build_viquad_dev_evaluator(
@@ -232,7 +297,7 @@ def build_viquad_dev_evaluator(
         corpus=corpus,
         relevant_docs=relevant_docs,
         name="uit-viquad2-validation",
-        show_progress_bar=True,
+        show_progress_bar=False,
     )
 
 
@@ -253,17 +318,21 @@ def iter_static_bm25_rows(
     train_dataset: Dataset,
     negative_lookup: dict[str, list[str]],
 ) -> dict[str, str]:
-    total_rows = len(train_dataset)
-    for row_index, row in enumerate(train_dataset, start=1):
+    progress_bar = tqdm(
+        train_dataset,
+        total=len(train_dataset),
+        desc="Cache rows",
+        unit="row",
+        mininterval=2.0,
+        dynamic_ncols=True,
+    )
+    for row in progress_bar:
         record = {
             "query": row["query"],
             "positive": row["positive"],
         }
         for idx, negative in enumerate(negative_lookup[row["query"]], start=1):
             record[f"negative_{idx}"] = negative
-
-        if row_index % 10000 == 0 or row_index == total_rows:
-            print(f"[info] Materialized {row_index}/{total_rows} training rows")
 
         yield record
 
@@ -306,14 +375,22 @@ def build_static_bm25_dataset(
         f"[info] Retrieving BM25 candidates for {len(unique_queries)} unique queries "
         f"in batches of {batch_size}..."
     )
+    total_batches = (len(unique_queries) + batch_size - 1) // batch_size
+    batch_iterator = tqdm(
+        range(0, len(unique_queries), batch_size),
+        total=total_batches,
+        desc="BM25 batches",
+        unit="batch",
+        mininterval=2.0,
+        dynamic_ncols=True,
+    )
 
-    for batch_start in range(0, len(unique_queries), batch_size):
+    for batch_start in batch_iterator:
         batch_end = min(batch_start + batch_size, len(unique_queries))
         batch_queries = unique_queries[batch_start:batch_end]
-        print(
-            f"[info] BM25 batch {batch_start // batch_size + 1}/"
-            f"{(len(unique_queries) + batch_size - 1) // batch_size}: "
-            f"queries {batch_start + 1}-{batch_end}"
+        batch_iterator.set_postfix_str(
+            f"queries {batch_start + 1}-{batch_end}",
+            refresh=False,
         )
         query_tokens = bm25s.tokenize(batch_queries, stopwords=[])
         doc_ids, _ = retriever.retrieve(query_tokens, k=candidate_pool)
@@ -399,15 +476,16 @@ def save_run_config(
     )
 
 
-def train(
+def train_one_epoch(
     model: SentenceTransformer,
     train_dataset: Dataset,
     output_dir: Path,
     args: argparse.Namespace,
+    epoch_index: int,
 ) -> None:
     train_args = SentenceTransformerTrainingArguments(
-        output_dir=str(output_dir / "checkpoints"),
-        num_train_epochs=args.epochs,
+        output_dir=str(output_dir / "checkpoints" / f"epoch_{epoch_index}"),
+        num_train_epochs=1,
         learning_rate=args.lr,
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
@@ -421,7 +499,7 @@ def train(
         save_total_limit=args.save_total_limit,
         logging_steps=args.logging_steps,
         report_to="none",
-        run_name="static-bm25-vn-retrieval",
+        run_name=f"static-bm25-vn-retrieval-epoch-{epoch_index}",
     )
     loss = CachedMultipleNegativesRankingLoss(
         model,
@@ -437,7 +515,7 @@ def train(
 
 
 def run_dev_evaluation(
-    evaluator: InformationRetrievalEvaluator,
+    evaluator: InformationRetrievalEvaluator | SequentialEvaluator,
     model: SentenceTransformer,
     output_path: Path,
 ) -> None:
@@ -452,8 +530,13 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     model = build_sentence_transformer(args.model_name, args.max_seq_length)
 
-    base_train_dataset, corpus, data_stats = build_train_pairs(
-        max_train_pairs=args.max_train_pairs
+    base_train_dataset, corpus, data_stats, dev_evaluator = (
+        build_train_data_and_evaluator(
+            max_train_pairs=args.max_train_pairs,
+            viquad_eval_queries=args.max_eval_queries,
+            greennode_eval_queries=args.greennode_eval_queries,
+            seed=args.seed,
+        )
     )
     static_train_dataset, mining_stats = build_static_bm25_dataset(
         base_train_dataset,
@@ -471,14 +554,19 @@ def main() -> None:
         )
     )
 
-    dev_evaluator = build_viquad_dev_evaluator(args.max_eval_queries, args.seed)
-    print("[info] Running initial ViQuAD validation evaluation...")
+    print("[info] Running initial retrieval evaluation on ViQuAD + GreenNode dev...")
     run_dev_evaluation(dev_evaluator, model, output_dir / "eval_initial")
 
     print("[info] Starting training with static BM25 hard negatives...")
-    train(model, static_train_dataset, output_dir, args)
+    for epoch_index in range(1, args.epochs + 1):
+        print(f"[info] Training epoch {epoch_index}/{args.epochs}...")
+        train_one_epoch(model, static_train_dataset, output_dir, args, epoch_index)
+        print(f"[info] Running retrieval evaluation after epoch {epoch_index}...")
+        run_dev_evaluation(
+            dev_evaluator, model, output_dir / f"eval_epoch_{epoch_index}"
+        )
 
-    print("[info] Running final ViQuAD validation evaluation...")
+    print("[info] Running final retrieval evaluation...")
     run_dev_evaluation(dev_evaluator, model, output_dir / "eval_final")
 
     final_dir = output_dir / "final"

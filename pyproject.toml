@@ -15,6 +15,7 @@ dependencies = [
   "accelerate==1.13.0",
   "mteb==2.12.7",
   "bm25s==0.3.3",
+  "tqdm==4.67.1",
   "torch==2.6.0",
   "torchvision==0.21.0",
 ]
