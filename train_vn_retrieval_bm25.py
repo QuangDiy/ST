@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import random
 import shutil
@@ -20,6 +21,9 @@ from sentence_transformers.evaluation import InformationRetrievalEvaluator
 from sentence_transformers.losses import CachedMultipleNegativesRankingLoss
 from sentence_transformers.models import Normalize, Pooling, Transformer
 from sentence_transformers.training_args import BatchSamplers
+
+
+logging.getLogger("bm25s").setLevel(logging.WARNING)
 
 
 GREENNODE_BASE_URL = "https://huggingface.co/datasets/GreenNode/GreenNode-Table-Markdown-Retrieval-VN/resolve/main"
@@ -48,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_total_limit", type=int, default=2)
     parser.add_argument("--num_hard_negatives", type=int, default=7)
     parser.add_argument("--bm25_candidate_pool", type=int, default=64)
+    parser.add_argument("--bm25_query_batch_size", type=int, default=2048)
     parser.add_argument("--max_train_pairs", type=int, default=None)
     parser.add_argument("--max_eval_queries", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
@@ -273,43 +278,58 @@ def build_static_bm25_dataset(
     retriever = bm25s.BM25(method="lucene")
     retriever.index(corpus_tokens)
 
-    print(
-        f"[info] Retrieving BM25 candidates for {len(unique_queries)} unique queries..."
-    )
-    query_tokens = bm25s.tokenize(unique_queries, stopwords=[])
-    doc_ids, _ = retriever.retrieve(query_tokens, k=candidate_pool)
-
     rng = random.Random(args.seed)
     negative_lookup: dict[str, list[str]] = {}
     fallback_queries = 0
+    batch_size = max(1, args.bm25_query_batch_size)
 
-    for query_index, query in enumerate(unique_queries):
-        positives = query_to_positives[query]
-        negatives: list[str] = []
+    print(
+        f"[info] Retrieving BM25 candidates for {len(unique_queries)} unique queries "
+        f"in batches of {batch_size}..."
+    )
 
-        for corpus_idx in doc_ids[query_index]:
-            candidate = corpus[int(corpus_idx)]
-            if candidate in positives or candidate in negatives:
-                continue
-            negatives.append(candidate)
-            if len(negatives) == args.num_hard_negatives:
-                break
+    for batch_start in range(0, len(unique_queries), batch_size):
+        batch_end = min(batch_start + batch_size, len(unique_queries))
+        batch_queries = unique_queries[batch_start:batch_end]
+        print(
+            f"[info] BM25 batch {batch_start // batch_size + 1}/"
+            f"{(len(unique_queries) + batch_size - 1) // batch_size}: "
+            f"queries {batch_start + 1}-{batch_end}"
+        )
+        query_tokens = bm25s.tokenize(batch_queries, stopwords=[])
+        doc_ids, _ = retriever.retrieve(query_tokens, k=candidate_pool)
 
-        if len(negatives) < args.num_hard_negatives:
-            fallback_queries += 1
-            max_attempts = max(len(corpus) * 2, 1000)
-            attempts = 0
-            while len(negatives) < args.num_hard_negatives and attempts < max_attempts:
-                candidate = corpus[rng.randrange(len(corpus))]
-                attempts += 1
+        for batch_offset, query in enumerate(batch_queries):
+            positives = query_to_positives[query]
+            negatives: list[str] = []
+
+            for corpus_idx in doc_ids[batch_offset]:
+                candidate = corpus[int(corpus_idx)]
                 if candidate in positives or candidate in negatives:
                     continue
                 negatives.append(candidate)
+                if len(negatives) == args.num_hard_negatives:
+                    break
 
-        if len(negatives) != args.num_hard_negatives:
-            raise RuntimeError(f"Could not mine enough negatives for query: {query}")
+            if len(negatives) < args.num_hard_negatives:
+                fallback_queries += 1
+                max_attempts = max(len(corpus) * 2, 1000)
+                attempts = 0
+                while (
+                    len(negatives) < args.num_hard_negatives and attempts < max_attempts
+                ):
+                    candidate = corpus[rng.randrange(len(corpus))]
+                    attempts += 1
+                    if candidate in positives or candidate in negatives:
+                        continue
+                    negatives.append(candidate)
 
-        negative_lookup[query] = negatives
+            if len(negatives) != args.num_hard_negatives:
+                raise RuntimeError(
+                    f"Could not mine enough negatives for query: {query}"
+                )
+
+            negative_lookup[query] = negatives
 
     dataset_dict = {"query": [], "positive": []}
     for idx in range(args.num_hard_negatives):

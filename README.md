@@ -17,6 +17,16 @@ If you need a CUDA-specific PyTorch build, install that first from the PyTorch i
 pip install -e .
 ```
 
+If you are on a cloud T4 runtime and hit `operator torchvision::nms does not exist`, your `torch` and `torchvision` wheels are mismatched. Reinstall matching wheels and restart the runtime:
+
+```bash
+pip uninstall -y torch torchvision torchaudio
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+pip install -e .
+```
+
+If you do not need vision packages at all, uninstalling `torchvision` also works because this project does not use image models.
+
 ## Train
 
 ```bash
@@ -35,6 +45,7 @@ Useful flags:
 - `--max_seq_length 768` keeps more GreenNode context
 - `--max_train_pairs N` is handy for smoke tests
 - `--overwrite_bm25_cache` rebuilds the static BM25 negatives
+- `--bm25_query_batch_size` controls how many queries are mined per BM25 batch to avoid long silent runs
 - `--fp16` or `--bf16` depends on your GPU
 
 The script uses:
