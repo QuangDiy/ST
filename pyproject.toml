@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vn-retrieval-bm25"
+version = "0.1.0"
+description = "Vietnamese single-vector retrieval training with static BM25 hard negatives."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "transformers==4.51.3",
+  "sentence-transformers==4.1.0",
+  "datasets==4.8.4",
+  "accelerate==1.13.0",
+  "mteb==2.12.7",
+  "bm25s==0.3.3",
+  "torch==2.6.0",
+]
+
+[project.scripts]
+train-vn-retrieval = "train_vn_retrieval_bm25:main"
+eval-vn-retrieval = "eval_vn_retrieval_mteb:main"
+
+[tool.hatch.build.targets.wheel]
+include = [
+  "train_vn_retrieval_bm25.py",
+  "eval_vn_retrieval_mteb.py",
+  "README.md",
+]
