@@ -1,9 +1,13 @@
 import argparse
 import json
+import os
 import random
 import shutil
 from collections import defaultdict
 from pathlib import Path
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 
 import bm25s
 from datasets import Dataset, load_dataset, load_from_disk
