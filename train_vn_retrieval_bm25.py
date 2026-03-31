@@ -6,6 +6,7 @@ import random
 import shutil
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
@@ -476,6 +477,92 @@ def save_run_config(
     )
 
 
+def get_evaluator_label(evaluator: InformationRetrievalEvaluator) -> str:
+    name = evaluator.name.lower()
+    if "viquad" in name:
+        return "viquad"
+    if "greennode" in name:
+        return "greennode"
+    return name.replace("-", "_")
+
+
+def build_eval_record(
+    evaluator: InformationRetrievalEvaluator | SequentialEvaluator,
+    metrics: dict[str, float],
+    stage_name: str,
+    output_path: Path,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "stage": stage_name,
+        "output_path": str(output_path),
+        "sequential_score": metrics.get("sequential_score"),
+    }
+
+    subevaluators = (
+        list(evaluator.evaluators)
+        if isinstance(evaluator, SequentialEvaluator)
+        else [evaluator]
+    )
+    for subevaluator in subevaluators:
+        label = get_evaluator_label(subevaluator)
+        primary_metric = getattr(subevaluator, "primary_metric", None)
+        if primary_metric and primary_metric in metrics:
+            record[f"{label}_primary_metric"] = primary_metric
+            record[f"{label}_primary_score"] = metrics[primary_metric]
+
+    return record
+
+
+def append_eval_summary(output_dir: Path, record: dict[str, Any]) -> None:
+    jsonl_path = output_dir / "evaluation_summary.jsonl"
+    markdown_path = output_dir / "evaluation_summary.md"
+
+    with jsonl_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    records = [
+        json.loads(line)
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    headers = [
+        "stage",
+        "sequential_score",
+        "viquad_primary_score",
+        "greennode_primary_score",
+        "viquad_primary_metric",
+        "greennode_primary_metric",
+    ]
+    lines = [
+        "# Evaluation Summary",
+        "",
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for row in records:
+        values = []
+        for header in headers:
+            value = row.get(header, "")
+            if isinstance(value, float):
+                value = f"{value:.6f}"
+            values.append(str(value))
+        lines.append("| " + " | ".join(values) + " |")
+
+    markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def print_eval_summary(record: dict[str, Any]) -> None:
+    parts = [f"stage={record['stage']}"]
+    if record.get("viquad_primary_score") is not None:
+        parts.append(f"viquad={record['viquad_primary_score']:.6f}")
+    if record.get("greennode_primary_score") is not None:
+        parts.append(f"greennode={record['greennode_primary_score']:.6f}")
+    if record.get("sequential_score") is not None:
+        parts.append(f"combined={record['sequential_score']:.6f}")
+    print("[eval] " + " | ".join(parts))
+
+
 def train_one_epoch(
     model: SentenceTransformer,
     train_dataset: Dataset,
@@ -517,10 +604,17 @@ def train_one_epoch(
 def run_dev_evaluation(
     evaluator: InformationRetrievalEvaluator | SequentialEvaluator,
     model: SentenceTransformer,
+    output_dir: Path,
+    stage_name: str,
     output_path: Path,
-) -> None:
+) -> dict[str, float]:
+    output_dir.mkdir(parents=True, exist_ok=True)
     output_path.mkdir(parents=True, exist_ok=True)
-    evaluator(model, output_path=str(output_path))
+    metrics = evaluator(model, output_path=str(output_path))
+    record = build_eval_record(evaluator, metrics, stage_name, output_path)
+    append_eval_summary(output_dir, record)
+    print_eval_summary(record)
+    return metrics
 
 
 def main() -> None:
@@ -555,7 +649,13 @@ def main() -> None:
     )
 
     print("[info] Running initial retrieval evaluation on ViQuAD + GreenNode dev...")
-    run_dev_evaluation(dev_evaluator, model, output_dir / "eval_initial")
+    run_dev_evaluation(
+        dev_evaluator,
+        model,
+        output_dir,
+        "initial",
+        output_dir / "eval_initial",
+    )
 
     print("[info] Starting training with static BM25 hard negatives...")
     for epoch_index in range(1, args.epochs + 1):
@@ -563,11 +663,21 @@ def main() -> None:
         train_one_epoch(model, static_train_dataset, output_dir, args, epoch_index)
         print(f"[info] Running retrieval evaluation after epoch {epoch_index}...")
         run_dev_evaluation(
-            dev_evaluator, model, output_dir / f"eval_epoch_{epoch_index}"
+            dev_evaluator,
+            model,
+            output_dir,
+            f"epoch_{epoch_index}",
+            output_dir / f"eval_epoch_{epoch_index}",
         )
 
     print("[info] Running final retrieval evaluation...")
-    run_dev_evaluation(dev_evaluator, model, output_dir / "eval_final")
+    run_dev_evaluation(
+        dev_evaluator,
+        model,
+        output_dir,
+        "final",
+        output_dir / "eval_final",
+    )
 
     final_dir = output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)

@@ -78,3 +78,4 @@ The evaluation script runs MTEB on:
 - The model is wrapped as `Transformer + mean pooling + Normalize`, so it becomes a proper single-vector sentence-transformer model.
 - BM25 negatives are mined once and cached to disk in `output/.../bm25_static_cache` by default, which keeps repeated experiments much faster.
 - Training now runs retrieval evaluation at the start, after each epoch, and at the end using both ViQuAD and a held-out GreenNode subset.
+- A compact metric summary is written to `output/.../evaluation_summary.md` and `output/.../evaluation_summary.jsonl` with separate primary scores for ViQuAD and GreenNode.
