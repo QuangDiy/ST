@@ -249,6 +249,25 @@ def group_positives_by_query(train_dataset: Dataset) -> dict[str, set[str]]:
     return query_to_positives
 
 
+def iter_static_bm25_rows(
+    train_dataset: Dataset,
+    negative_lookup: dict[str, list[str]],
+) -> dict[str, str]:
+    total_rows = len(train_dataset)
+    for row_index, row in enumerate(train_dataset, start=1):
+        record = {
+            "query": row["query"],
+            "positive": row["positive"],
+        }
+        for idx, negative in enumerate(negative_lookup[row["query"]], start=1):
+            record[f"negative_{idx}"] = negative
+
+        if row_index % 10000 == 0 or row_index == total_rows:
+            print(f"[info] Materialized {row_index}/{total_rows} training rows")
+
+        yield record
+
+
 def build_static_bm25_dataset(
     train_dataset: Dataset,
     corpus: list[str],
@@ -331,30 +350,27 @@ def build_static_bm25_dataset(
 
             negative_lookup[query] = negatives
 
-    dataset_dict = {"query": [], "positive": []}
-    for idx in range(args.num_hard_negatives):
-        dataset_dict[f"negative_{idx + 1}"] = []
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_path = cache_dir.parent / "bm25_static_cache.jsonl"
+    if jsonl_path.exists():
+        jsonl_path.unlink()
 
     print(
         f"[info] BM25 retrieval complete. Building static training dataset for {len(train_dataset)} rows..."
     )
-    for row_index, row in enumerate(train_dataset, start=1):
-        dataset_dict["query"].append(row["query"])
-        dataset_dict["positive"].append(row["positive"])
-        negatives = negative_lookup[row["query"]]
-        for idx, negative in enumerate(negatives, start=1):
-            dataset_dict[f"negative_{idx}"].append(negative)
-        if row_index % 10000 == 0 or row_index == len(train_dataset):
-            print(f"[info] Materialized {row_index}/{len(train_dataset)} training rows")
+    print(f"[info] Writing mined examples to {jsonl_path}...")
+    with jsonl_path.open("w", encoding="utf-8") as handle:
+        for record in iter_static_bm25_rows(train_dataset, negative_lookup):
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    print("[info] Converting mined examples to Hugging Face Dataset...")
-    static_dataset = Dataset.from_dict(dataset_dict)
-    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    print("[info] Converting JSONL cache to Hugging Face Dataset...")
+    static_dataset = load_dataset("json", data_files=str(jsonl_path), split="train")
     if cache_dir.exists():
         shutil.rmtree(cache_dir)
     print(f"[info] Saving static BM25 cache to {cache_dir}...")
     static_dataset.save_to_disk(str(cache_dir))
     print("[info] Static BM25 cache saved.")
+    jsonl_path.unlink(missing_ok=True)
 
     stats = {
         "bm25_candidate_pool": candidate_pool,
