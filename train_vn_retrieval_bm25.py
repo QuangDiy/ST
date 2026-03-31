@@ -436,6 +436,15 @@ def train(
     trainer.train()
 
 
+def run_dev_evaluation(
+    evaluator: InformationRetrievalEvaluator,
+    model: SentenceTransformer,
+    output_path: Path,
+) -> None:
+    output_path.mkdir(parents=True, exist_ok=True)
+    evaluator(model, output_path=str(output_path))
+
+
 def main() -> None:
     args = parse_args()
     random.seed(args.seed)
@@ -464,13 +473,13 @@ def main() -> None:
 
     dev_evaluator = build_viquad_dev_evaluator(args.max_eval_queries, args.seed)
     print("[info] Running initial ViQuAD validation evaluation...")
-    dev_evaluator(model, output_path=str(output_dir / "eval_initial"))
+    run_dev_evaluation(dev_evaluator, model, output_dir / "eval_initial")
 
     print("[info] Starting training with static BM25 hard negatives...")
     train(model, static_train_dataset, output_dir, args)
 
     print("[info] Running final ViQuAD validation evaluation...")
-    dev_evaluator(model, output_path=str(output_dir / "eval_final"))
+    run_dev_evaluation(dev_evaluator, model, output_dir / "eval_final")
 
     final_dir = output_dir / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
