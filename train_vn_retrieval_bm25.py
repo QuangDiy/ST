@@ -25,10 +25,8 @@ from sentence_transformers.evaluation import (
     InformationRetrievalEvaluator,
     SequentialEvaluator,
 )
-from sentence_transformers.losses import (
-    CachedMultipleNegativesRankingLoss,
-    MultipleNegativesRankingLoss,
-)
+from sentence_transformers.losses import MultipleNegativesRankingLoss
+from transformers import TrainerCallback
 from sentence_transformers.models import Normalize, Pooling, Transformer
 from sentence_transformers.training_args import BatchSamplers
 from tqdm.auto import tqdm
@@ -58,7 +56,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_seq_length", type=int, default=768)
     parser.add_argument("--per_device_train_batch_size", type=int, default=64)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--loss_mini_batch_size", type=int, default=16)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument("--logging_steps", type=int, default=50)
     parser.add_argument("--save_total_limit", type=int, default=2)
@@ -627,100 +624,75 @@ def print_eval_summary(record: dict[str, Any]) -> None:
     print("[eval] " + " | ".join(parts))
 
 
-def is_cuda_capacity_error(error: RuntimeError) -> bool:
-    message = str(error)
-    markers = [
-        "CUDA out of memory",
-        "CUBLAS_STATUS_NOT_INITIALIZED",
-        "CUBLAS_STATUS_NOT_SUPPORTED",
-        "CUDA error",
-    ]
-    return any(marker in message for marker in markers)
+class EpochEvalCallback(TrainerCallback):
+    """Runs the dev evaluator at the end of each epoch (main process only)."""
+
+    def __init__(self, evaluator: SequentialEvaluator, output_dir: Path) -> None:
+        self._evaluator = evaluator
+        self._output_dir = output_dir
+
+    def on_epoch_end(self, args, state, control, model=None, **kwargs) -> None:
+        if not state.is_world_process_zero:
+            return
+        epoch_num = round(state.epoch)
+        run_dev_evaluation(
+            self._evaluator,
+            model,
+            self._output_dir,
+            f"epoch_{epoch_num}",
+            self._output_dir / f"eval_epoch_{epoch_num}",
+        )
 
 
-def train_one_epoch(
+def train_model(
     model: SentenceTransformer,
     train_dataset: Dataset,
+    dev_evaluator: SequentialEvaluator,
     output_dir: Path,
     args: argparse.Namespace,
-    epoch_index: int,
 ) -> None:
+    """Train for all epochs in a single Trainer call using MultipleNegativesRankingLoss.
+
+    CachedMultipleNegativesRankingLoss triggers CUBLAS_STATUS_NOT_INITIALIZED in DDP
+    mode because its all_gather + cuBLAS path races against CUDA initialisation on
+    peer processes.  Plain MultipleNegativesRankingLoss avoids this entirely and is
+    the recommended loss for DDP training.
+    """
     is_main_process = int(os.environ.get("RANK", "0")) == 0
     show_trainer_tqdm = ENABLE_TQDM and is_main_process
-    per_device_batch_size = args.per_device_train_batch_size
-    loss_mini_batch_size = args.loss_mini_batch_size
-    use_cached_loss = True
 
-    while True:
-        train_args = SentenceTransformerTrainingArguments(
-            output_dir=str(output_dir / "checkpoints" / f"epoch_{epoch_index}"),
-            num_train_epochs=1,
-            learning_rate=args.lr,
-            warmup_ratio=args.warmup_ratio,
-            weight_decay=args.weight_decay,
-            per_device_train_batch_size=per_device_batch_size,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            dataloader_num_workers=args.dataloader_num_workers,
-            fp16=args.fp16,
-            bf16=args.bf16,
-            batch_sampler=BatchSamplers.NO_DUPLICATES,
-            save_strategy="epoch",
-            save_total_limit=args.save_total_limit,
-            logging_steps=args.logging_steps,
-            disable_tqdm=not show_trainer_tqdm,
-            report_to="none",
-            run_name=f"static-bm25-vn-retrieval-epoch-{epoch_index}",
-        )
-        if use_cached_loss:
-            loss = CachedMultipleNegativesRankingLoss(
-                model,
-                mini_batch_size=loss_mini_batch_size,
-            )
-        else:
-            loss = MultipleNegativesRankingLoss(model)
-        trainer = SentenceTransformerTrainer(
-            model=model,
-            args=train_args,
-            train_dataset=train_dataset,
-            loss=loss,
-        )
-        try:
-            trainer.train()
-            return
-        except RuntimeError as error:
-            if not is_cuda_capacity_error(error):
-                raise
+    train_args = SentenceTransformerTrainingArguments(
+        output_dir=str(output_dir / "checkpoints"),
+        num_train_epochs=args.epochs,
+        learning_rate=args.lr,
+        warmup_ratio=args.warmup_ratio,
+        weight_decay=args.weight_decay,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        dataloader_num_workers=args.dataloader_num_workers,
+        fp16=args.fp16,
+        bf16=args.bf16,
+        batch_sampler=BatchSamplers.NO_DUPLICATES,
+        save_strategy="epoch",
+        save_total_limit=args.save_total_limit,
+        logging_steps=args.logging_steps,
+        disable_tqdm=not show_trainer_tqdm,
+        report_to="none",
+        run_name="static-bm25-vn-retrieval",
+        # Required for stable DDP training
+        dataloader_drop_last=True,
+        ddp_find_unused_parameters=False,
+    )
 
-            if use_cached_loss and "CUBLAS_STATUS_NOT_SUPPORTED" in str(error):
-                print(
-                    "[warn] CachedMultipleNegativesRankingLoss is unstable on this "
-                    "CUDA setup. Retrying epoch "
-                    f"{epoch_index} with MultipleNegativesRankingLoss."
-                )
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                use_cached_loss = False
-                continue
-
-            next_train_batch = max(1, per_device_batch_size // 2)
-            next_loss_mini_batch = max(1, loss_mini_batch_size // 2)
-            can_reduce = (
-                next_train_batch < per_device_batch_size
-                or next_loss_mini_batch < loss_mini_batch_size
-            )
-            if not can_reduce:
-                raise
-
-            print(
-                "[warn] CUDA capacity error while training epoch "
-                f"{epoch_index}: {error}. Retrying with "
-                f"per_device_train_batch_size={next_train_batch}, "
-                f"loss_mini_batch_size={next_loss_mini_batch}."
-            )
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            per_device_batch_size = next_train_batch
-            loss_mini_batch_size = next_loss_mini_batch
+    loss = MultipleNegativesRankingLoss(model)
+    trainer = SentenceTransformerTrainer(
+        model=model,
+        args=train_args,
+        train_dataset=train_dataset,
+        loss=loss,
+        callbacks=[EpochEvalCallback(dev_evaluator, output_dir)],
+    )
+    trainer.train()
 
 
 def run_dev_evaluation(
@@ -803,19 +775,7 @@ def main() -> None:
 
     if is_main_process:
         print("[info] Starting training with static BM25 hard negatives...")
-    for epoch_index in range(1, args.epochs + 1):
-        if is_main_process:
-            print(f"[info] Training epoch {epoch_index}/{args.epochs}...")
-        train_one_epoch(model, static_train_dataset, output_dir, args, epoch_index)
-        if is_main_process:
-            print(f"[info] Running retrieval evaluation after epoch {epoch_index}...")
-            run_dev_evaluation(
-                dev_evaluator,
-                model,
-                output_dir,
-                f"epoch_{epoch_index}",
-                output_dir / f"eval_epoch_{epoch_index}",
-            )
+    train_model(model, static_train_dataset, dev_evaluator, output_dir, args)
 
     if is_main_process:
         print("[info] Running final retrieval evaluation...")
