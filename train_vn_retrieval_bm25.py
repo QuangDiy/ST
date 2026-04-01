@@ -25,7 +25,10 @@ from sentence_transformers.evaluation import (
     InformationRetrievalEvaluator,
     SequentialEvaluator,
 )
-from sentence_transformers.losses import CachedMultipleNegativesRankingLoss
+from sentence_transformers.losses import (
+    CachedMultipleNegativesRankingLoss,
+    MultipleNegativesRankingLoss,
+)
 from sentence_transformers.models import Normalize, Pooling, Transformer
 from sentence_transformers.training_args import BatchSamplers
 from tqdm.auto import tqdm
@@ -629,6 +632,7 @@ def is_cuda_capacity_error(error: RuntimeError) -> bool:
     markers = [
         "CUDA out of memory",
         "CUBLAS_STATUS_NOT_INITIALIZED",
+        "CUBLAS_STATUS_NOT_SUPPORTED",
         "CUDA error",
     ]
     return any(marker in message for marker in markers)
@@ -643,6 +647,7 @@ def train_one_epoch(
 ) -> None:
     per_device_batch_size = args.per_device_train_batch_size
     loss_mini_batch_size = args.loss_mini_batch_size
+    use_cached_loss = True
 
     while True:
         train_args = SentenceTransformerTrainingArguments(
@@ -664,10 +669,13 @@ def train_one_epoch(
             report_to="none",
             run_name=f"static-bm25-vn-retrieval-epoch-{epoch_index}",
         )
-        loss = CachedMultipleNegativesRankingLoss(
-            model,
-            mini_batch_size=loss_mini_batch_size,
-        )
+        if use_cached_loss:
+            loss = CachedMultipleNegativesRankingLoss(
+                model,
+                mini_batch_size=loss_mini_batch_size,
+            )
+        else:
+            loss = MultipleNegativesRankingLoss(model)
         trainer = SentenceTransformerTrainer(
             model=model,
             args=train_args,
@@ -680,6 +688,17 @@ def train_one_epoch(
         except RuntimeError as error:
             if not is_cuda_capacity_error(error):
                 raise
+
+            if use_cached_loss and "CUBLAS_STATUS_NOT_SUPPORTED" in str(error):
+                print(
+                    "[warn] CachedMultipleNegativesRankingLoss is unstable on this "
+                    "CUDA setup. Retrying epoch "
+                    f"{epoch_index} with MultipleNegativesRankingLoss."
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                use_cached_loss = False
+                continue
 
             next_train_batch = max(1, per_device_batch_size // 2)
             next_loss_mini_batch = max(1, loss_mini_batch_size // 2)
