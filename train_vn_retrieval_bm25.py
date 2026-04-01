@@ -624,6 +624,16 @@ def print_eval_summary(record: dict[str, Any]) -> None:
     print("[eval] " + " | ".join(parts))
 
 
+def is_cuda_capacity_error(error: RuntimeError) -> bool:
+    message = str(error)
+    markers = [
+        "CUDA out of memory",
+        "CUBLAS_STATUS_NOT_INITIALIZED",
+        "CUDA error",
+    ]
+    return any(marker in message for marker in markers)
+
+
 def train_one_epoch(
     model: SentenceTransformer,
     train_dataset: Dataset,
@@ -631,36 +641,65 @@ def train_one_epoch(
     args: argparse.Namespace,
     epoch_index: int,
 ) -> None:
-    train_args = SentenceTransformerTrainingArguments(
-        output_dir=str(output_dir / "checkpoints" / f"epoch_{epoch_index}"),
-        num_train_epochs=1,
-        learning_rate=args.lr,
-        warmup_ratio=args.warmup_ratio,
-        weight_decay=args.weight_decay,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        dataloader_num_workers=args.dataloader_num_workers,
-        fp16=args.fp16,
-        bf16=args.bf16,
-        batch_sampler=BatchSamplers.NO_DUPLICATES,
-        save_strategy="epoch",
-        save_total_limit=args.save_total_limit,
-        logging_steps=args.logging_steps,
-        disable_tqdm=True,
-        report_to="none",
-        run_name=f"static-bm25-vn-retrieval-epoch-{epoch_index}",
-    )
-    loss = CachedMultipleNegativesRankingLoss(
-        model,
-        mini_batch_size=args.loss_mini_batch_size,
-    )
-    trainer = SentenceTransformerTrainer(
-        model=model,
-        args=train_args,
-        train_dataset=train_dataset,
-        loss=loss,
-    )
-    trainer.train()
+    per_device_batch_size = args.per_device_train_batch_size
+    loss_mini_batch_size = args.loss_mini_batch_size
+
+    while True:
+        train_args = SentenceTransformerTrainingArguments(
+            output_dir=str(output_dir / "checkpoints" / f"epoch_{epoch_index}"),
+            num_train_epochs=1,
+            learning_rate=args.lr,
+            warmup_ratio=args.warmup_ratio,
+            weight_decay=args.weight_decay,
+            per_device_train_batch_size=per_device_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            dataloader_num_workers=args.dataloader_num_workers,
+            fp16=args.fp16,
+            bf16=args.bf16,
+            batch_sampler=BatchSamplers.NO_DUPLICATES,
+            save_strategy="epoch",
+            save_total_limit=args.save_total_limit,
+            logging_steps=args.logging_steps,
+            disable_tqdm=True,
+            report_to="none",
+            run_name=f"static-bm25-vn-retrieval-epoch-{epoch_index}",
+        )
+        loss = CachedMultipleNegativesRankingLoss(
+            model,
+            mini_batch_size=loss_mini_batch_size,
+        )
+        trainer = SentenceTransformerTrainer(
+            model=model,
+            args=train_args,
+            train_dataset=train_dataset,
+            loss=loss,
+        )
+        try:
+            trainer.train()
+            return
+        except RuntimeError as error:
+            if not is_cuda_capacity_error(error):
+                raise
+
+            next_train_batch = max(1, per_device_batch_size // 2)
+            next_loss_mini_batch = max(1, loss_mini_batch_size // 2)
+            can_reduce = (
+                next_train_batch < per_device_batch_size
+                or next_loss_mini_batch < loss_mini_batch_size
+            )
+            if not can_reduce:
+                raise
+
+            print(
+                "[warn] CUDA capacity error while training epoch "
+                f"{epoch_index}: {error}. Retrying with "
+                f"per_device_train_batch_size={next_train_batch}, "
+                f"loss_mini_batch_size={next_loss_mini_batch}."
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            per_device_batch_size = next_train_batch
+            loss_mini_batch_size = next_loss_mini_batch
 
 
 def run_dev_evaluation(
