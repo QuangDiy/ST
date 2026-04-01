@@ -123,6 +123,25 @@ def wait_for_bm25_cache(cache_dir: Path, timeout_s: int = 7200) -> None:
         time.sleep(2)
 
 
+def wait_and_load_bm25_cache(cache_dir: Path, timeout_s: int = 7200) -> Dataset:
+    start_time = time.time()
+    while True:
+        if time.time() - start_time > timeout_s:
+            raise TimeoutError(
+                f"Timed out waiting for a valid BM25 cache dataset at {cache_dir}"
+            )
+
+        if not cache_dir.exists():
+            time.sleep(2)
+            continue
+
+        try:
+            return load_from_disk(str(cache_dir))
+        except (FileNotFoundError, OSError, ValueError):
+            # save_to_disk may have created the directory but not finished writing shards.
+            time.sleep(2)
+
+
 def load_json_dataset(url: str) -> Dataset:
     return load_dataset("json", data_files=url, split="train")
 
@@ -683,8 +702,7 @@ def main() -> None:
     )
     if world_size > 1 and not is_main_process:
         cache_dir = get_cache_dir(output_dir, args)
-        wait_for_bm25_cache(cache_dir)
-        static_train_dataset = load_from_disk(str(cache_dir))
+        static_train_dataset = wait_and_load_bm25_cache(cache_dir)
         mining_stats = {
             "bm25_candidate_pool": args.bm25_candidate_pool,
             "num_hard_negatives": args.num_hard_negatives,
