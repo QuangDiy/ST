@@ -5,6 +5,7 @@ import os
 import random
 import shutil
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Generator
@@ -13,6 +14,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
 
 import bm25s
+import torch
 from datasets import Dataset, load_dataset, load_from_disk
 from sentence_transformers import (
     SentenceTransformer,
@@ -85,12 +87,40 @@ def serialize_document(title: str | None, text: str) -> str:
 
 
 def build_sentence_transformer(
-    model_name: str, max_seq_length: int
+    model_name: str, max_seq_length: int, device: str | None = None
 ) -> SentenceTransformer:
     transformer = Transformer(model_name, max_seq_length=max_seq_length)
     pooling = Pooling(transformer.get_word_embedding_dimension(), pooling_mode="mean")
     normalize = Normalize()
-    return SentenceTransformer(modules=[transformer, pooling, normalize])
+    return SentenceTransformer(
+        modules=[transformer, pooling, normalize],
+        device=device,
+    )
+
+
+def get_distributed_context() -> tuple[int, int, int, bool]:
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    is_main_process = rank == 0
+    return local_rank, rank, world_size, is_main_process
+
+
+def get_runtime_device(local_rank: int) -> str | None:
+    if not torch.cuda.is_available():
+        return None
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        torch.cuda.set_device(local_rank)
+        return f"cuda:{local_rank}"
+    return "cuda"
+
+
+def wait_for_bm25_cache(cache_dir: Path, timeout_s: int = 7200) -> None:
+    start_time = time.time()
+    while not cache_dir.exists():
+        if time.time() - start_time > timeout_s:
+            raise TimeoutError(f"Timed out waiting for BM25 cache at {cache_dir}")
+        time.sleep(2)
 
 
 def load_json_dataset(url: str) -> Dataset:
@@ -172,7 +202,7 @@ def build_greennode_train_and_evaluator(
         corpus=corpus_by_id,
         relevant_docs=relevant_docs,
         name="greennode-train-dev",
-        show_progress_bar=ENABLE_TQDM,
+        show_progress_bar=False,
     )
     stats = {
         "greennode_train_pairs": len(train_queries),
@@ -300,7 +330,7 @@ def build_viquad_dev_evaluator(
         corpus=corpus,
         relevant_docs=relevant_docs,
         name="uit-viquad2-validation",
-        show_progress_bar=ENABLE_TQDM,
+        show_progress_bar=False,
     )
 
 
@@ -597,6 +627,7 @@ def train_one_epoch(
         save_strategy="epoch",
         save_total_limit=args.save_total_limit,
         logging_steps=args.logging_steps,
+        disable_tqdm=True,
         report_to="none",
         run_name=f"static-bm25-vn-retrieval-epoch-{epoch_index}",
     )
@@ -632,9 +663,15 @@ def run_dev_evaluation(
 def main() -> None:
     args = parse_args()
     random.seed(args.seed)
+    local_rank, rank, world_size, is_main_process = get_distributed_context()
+    runtime_device = get_runtime_device(local_rank)
 
     output_dir = Path(args.output_dir)
-    model = build_sentence_transformer(args.model_name, args.max_seq_length)
+    model = build_sentence_transformer(
+        args.model_name,
+        args.max_seq_length,
+        device=runtime_device,
+    )
 
     base_train_dataset, corpus, data_stats, dev_evaluator = (
         build_train_data_and_evaluator(
@@ -644,57 +681,78 @@ def main() -> None:
             seed=args.seed,
         )
     )
-    static_train_dataset, mining_stats = build_static_bm25_dataset(
-        base_train_dataset,
-        corpus,
-        output_dir,
-        args,
-    )
+    if world_size > 1 and not is_main_process:
+        cache_dir = get_cache_dir(output_dir, args)
+        wait_for_bm25_cache(cache_dir)
+        static_train_dataset = load_from_disk(str(cache_dir))
+        mining_stats = {
+            "bm25_candidate_pool": args.bm25_candidate_pool,
+            "num_hard_negatives": args.num_hard_negatives,
+            "fallback_queries": -1,
+            "cached_train_rows": len(static_train_dataset),
+        }
+    else:
+        static_train_dataset, mining_stats = build_static_bm25_dataset(
+            base_train_dataset,
+            corpus,
+            output_dir,
+            args,
+        )
+
+    if world_size > 1 and is_main_process:
+        cache_dir = get_cache_dir(output_dir, args)
+        wait_for_bm25_cache(cache_dir)
+
     save_run_config(output_dir, args, data_stats, mining_stats)
 
-    print(
-        json.dumps(
-            {"data": data_stats, "mining": mining_stats},
-            indent=2,
-            ensure_ascii=False,
+    if is_main_process:
+        print(
+            json.dumps(
+                {"data": data_stats, "mining": mining_stats},
+                indent=2,
+                ensure_ascii=False,
+            )
         )
-    )
 
-    print("[info] Running initial retrieval evaluation on ViQuAD + GreenNode dev...")
-    run_dev_evaluation(
-        dev_evaluator,
-        model,
-        output_dir,
-        "initial",
-        output_dir / "eval_initial",
-    )
-
-    print("[info] Starting training with static BM25 hard negatives...")
-    for epoch_index in range(1, args.epochs + 1):
-        print(f"[info] Training epoch {epoch_index}/{args.epochs}...")
-        train_one_epoch(model, static_train_dataset, output_dir, args, epoch_index)
-        print(f"[info] Running retrieval evaluation after epoch {epoch_index}...")
+        print("[info] Running initial retrieval evaluation on ViQuAD + GreenNode dev...")
         run_dev_evaluation(
             dev_evaluator,
             model,
             output_dir,
-            f"epoch_{epoch_index}",
-            output_dir / f"eval_epoch_{epoch_index}",
+            "initial",
+            output_dir / "eval_initial",
         )
 
-    print("[info] Running final retrieval evaluation...")
-    run_dev_evaluation(
-        dev_evaluator,
-        model,
-        output_dir,
-        "final",
-        output_dir / "eval_final",
-    )
+    if is_main_process:
+        print("[info] Starting training with static BM25 hard negatives...")
+    for epoch_index in range(1, args.epochs + 1):
+        if is_main_process:
+            print(f"[info] Training epoch {epoch_index}/{args.epochs}...")
+        train_one_epoch(model, static_train_dataset, output_dir, args, epoch_index)
+        if is_main_process:
+            print(f"[info] Running retrieval evaluation after epoch {epoch_index}...")
+            run_dev_evaluation(
+                dev_evaluator,
+                model,
+                output_dir,
+                f"epoch_{epoch_index}",
+                output_dir / f"eval_epoch_{epoch_index}",
+            )
 
-    final_dir = output_dir / "final"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(final_dir))
-    print(f"[done] Final model saved to {final_dir}")
+    if is_main_process:
+        print("[info] Running final retrieval evaluation...")
+        run_dev_evaluation(
+            dev_evaluator,
+            model,
+            output_dir,
+            "final",
+            output_dir / "eval_final",
+        )
+
+        final_dir = output_dir / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(str(final_dir))
+        print(f"[done] Final model saved to {final_dir}")
 
 
 if __name__ == "__main__":
