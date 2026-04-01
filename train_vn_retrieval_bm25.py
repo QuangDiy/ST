@@ -7,7 +7,7 @@ import shutil
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
@@ -30,7 +30,7 @@ from tqdm.auto import tqdm
 
 
 logging.getLogger("bm25s").setLevel(logging.WARNING)
-ENABLE_TQDM = sys.stderr.isatty()
+ENABLE_TQDM = os.environ.get("FORCE_TQDM", "0") == "1" or sys.stderr.isatty()
 
 
 GREENNODE_BASE_URL = "https://huggingface.co/datasets/GreenNode/GreenNode-Table-Markdown-Retrieval-VN/resolve/main"
@@ -172,7 +172,7 @@ def build_greennode_train_and_evaluator(
         corpus=corpus_by_id,
         relevant_docs=relevant_docs,
         name="greennode-train-dev",
-        show_progress_bar=False,
+        show_progress_bar=ENABLE_TQDM,
     )
     stats = {
         "greennode_train_pairs": len(train_queries),
@@ -300,7 +300,7 @@ def build_viquad_dev_evaluator(
         corpus=corpus,
         relevant_docs=relevant_docs,
         name="uit-viquad2-validation",
-        show_progress_bar=False,
+        show_progress_bar=ENABLE_TQDM,
     )
 
 
@@ -320,7 +320,7 @@ def group_positives_by_query(train_dataset: Dataset) -> dict[str, set[str]]:
 def iter_static_bm25_rows(
     train_dataset: Dataset,
     negative_lookup: dict[str, list[str]],
-) -> dict[str, str]:
+) -> Generator[dict[str, str], None, None]:
     progress_bar = tqdm(
         train_dataset,
         total=len(train_dataset),
