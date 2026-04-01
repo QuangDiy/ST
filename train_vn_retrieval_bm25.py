@@ -645,6 +645,8 @@ def train_one_epoch(
     args: argparse.Namespace,
     epoch_index: int,
 ) -> None:
+    is_main_process = int(os.environ.get("RANK", "0")) == 0
+    show_trainer_tqdm = ENABLE_TQDM and is_main_process
     per_device_batch_size = args.per_device_train_batch_size
     loss_mini_batch_size = args.loss_mini_batch_size
     use_cached_loss = True
@@ -665,7 +667,7 @@ def train_one_epoch(
             save_strategy="epoch",
             save_total_limit=args.save_total_limit,
             logging_steps=args.logging_steps,
-            disable_tqdm=True,
+            disable_tqdm=not show_trainer_tqdm,
             report_to="none",
             run_name=f"static-bm25-vn-retrieval-epoch-{epoch_index}",
         )
