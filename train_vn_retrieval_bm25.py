@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import shutil
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from tqdm.auto import tqdm
 
 
 logging.getLogger("bm25s").setLevel(logging.WARNING)
+ENABLE_TQDM = sys.stderr.isatty()
 
 
 GREENNODE_BASE_URL = "https://huggingface.co/datasets/GreenNode/GreenNode-Table-Markdown-Retrieval-VN/resolve/main"
@@ -326,6 +328,7 @@ def iter_static_bm25_rows(
         unit="row",
         mininterval=2.0,
         dynamic_ncols=True,
+        disable=not ENABLE_TQDM,
     )
     for row in progress_bar:
         record = {
@@ -363,9 +366,9 @@ def build_static_bm25_dataset(
     )
 
     print(f"[info] Building BM25 index over {len(corpus)} documents...")
-    corpus_tokens = bm25s.tokenize(corpus, stopwords=[])
+    corpus_tokens = bm25s.tokenize(corpus, stopwords=[], show_progress=False)
     retriever = bm25s.BM25(method="lucene")
-    retriever.index(corpus_tokens)
+    retriever.index(corpus_tokens, show_progress=False)
 
     rng = random.Random(args.seed)
     negative_lookup: dict[str, list[str]] = {}
@@ -384,6 +387,7 @@ def build_static_bm25_dataset(
         unit="batch",
         mininterval=2.0,
         dynamic_ncols=True,
+        disable=not ENABLE_TQDM,
     )
 
     for batch_start in batch_iterator:
@@ -393,8 +397,16 @@ def build_static_bm25_dataset(
             f"queries {batch_start + 1}-{batch_end}",
             refresh=False,
         )
-        query_tokens = bm25s.tokenize(batch_queries, stopwords=[])
-        doc_ids, _ = retriever.retrieve(query_tokens, k=candidate_pool)
+        query_tokens = bm25s.tokenize(
+            batch_queries,
+            stopwords=[],
+            show_progress=False,
+        )
+        doc_ids, _ = retriever.retrieve(
+            query_tokens,
+            k=candidate_pool,
+            show_progress=False,
+        )
 
         for batch_offset, query in enumerate(batch_queries):
             positives = query_to_positives[query]
